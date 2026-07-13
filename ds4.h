@@ -23,6 +23,11 @@ typedef enum {
 } ds4_backend;
 
 typedef enum {
+    DS4_ARCH_DEEPSEEK = 0,
+    DS4_ARCH_QWEN3_CODER = 2,
+} ds_arch_type;
+
+typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,

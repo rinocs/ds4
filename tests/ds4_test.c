@@ -2180,6 +2180,69 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void write_gguf_str(FILE *f, const char *s) {
+    uint64_t len = strlen(s);
+    fwrite(&len, sizeof(len), 1, f);
+    fwrite(s, 1, len, f);
+}
+
+static void create_mock_qwen3_gguf(const char *path) {
+    FILE *f = fopen(path, "wb");
+    TEST_ASSERT(f != NULL);
+
+    uint32_t magic = 0x46554747; // "GGUF"
+    uint32_t version = 3;
+    uint64_t n_tensors = 0;
+    uint64_t n_kv = 2;
+
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&version, sizeof(version), 1, f);
+    fwrite(&n_tensors, sizeof(n_tensors), 1, f);
+    fwrite(&n_kv, sizeof(n_kv), 1, f);
+
+    // KV 1: general.architecture = "qwen2"
+    write_gguf_str(f, "general.architecture");
+    uint32_t type_string = 8; // GGUF_VALUE_STRING
+    fwrite(&type_string, sizeof(type_string), 1, f);
+    write_gguf_str(f, "qwen2");
+
+    // KV 2: tokenizer.ggml.tokens = array of 5 strings
+    write_gguf_str(f, "tokenizer.ggml.tokens");
+    uint32_t type_array = 9; // GGUF_VALUE_ARRAY
+    fwrite(&type_array, sizeof(type_array), 1, f);
+    uint32_t item_type = 8; // GGUF_VALUE_STRING
+    fwrite(&item_type, sizeof(item_type), 1, f);
+    uint64_t array_len = 5;
+    fwrite(&array_len, sizeof(array_len), 1, f);
+    for (uint64_t i = 0; i < array_len; i++) {
+        write_gguf_str(f, "dummy");
+    }
+
+    fclose(f);
+}
+
+static void test_qwen3_shape_dispatch(void) {
+    const char *temp_path = "temp_qwen3_mock.gguf";
+    create_mock_qwen3_gguf(temp_path);
+
+    ds4_engine *engine = NULL;
+    ds4_engine_options opt = {
+        .model_path = temp_path,
+        .inspect_only = true,
+        .backend = DS4_BACKEND_CPU,
+    };
+
+    int rc = ds4_engine_open(&engine, &opt);
+    TEST_ASSERT(rc == 0);
+    TEST_ASSERT(engine != NULL);
+
+    int model_id = ds4_engine_model_id(engine);
+    TEST_ASSERT(model_id == 2);
+
+    ds4_engine_close(engine);
+    remove(temp_path);
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -2204,6 +2267,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
+    {"--qwen3-shape-dispatch", "qwen3-shape-dispatch", "assert engine parses mock GGUF for Qwen3 and identifies model_id == 2", test_qwen3_shape_dispatch},
 };
 
 static void test_print_help(const char *prog) {

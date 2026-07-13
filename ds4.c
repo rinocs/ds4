@@ -3734,28 +3734,53 @@ static bool ds4_shape_matches_metadata(
 }
 
 static void ds4_select_shape_from_metadata(
-        uint32_t n_layer,
-        uint32_t n_embd,
-        uint32_t n_vocab,
-        uint32_t n_head,
-        uint32_t n_head_kv,
-        uint32_t n_head_dim,
-        uint32_t n_value_dim,
-        uint32_t n_rot,
-        uint32_t n_lora_q,
-        uint32_t n_lora_o,
-        uint32_t n_out_group,
-        uint32_t n_expert,
-        uint32_t n_expert_used,
-        uint32_t n_ff_exp,
-        uint32_t n_expert_shared,
-        uint32_t n_hash_layer,
-        uint32_t n_swa,
-        uint32_t n_indexer_head,
-        uint32_t n_indexer_head_dim,
-        uint32_t n_indexer_top_k,
-        uint32_t n_hc,
-        uint32_t n_hc_sinkhorn_iter) {
+        const ds4_model *m,
+        ds_arch_type    *out_arch,
+        uint32_t         n_layer,
+        uint32_t         n_embd,
+        uint32_t         n_vocab,
+        uint32_t         n_head,
+        uint32_t         n_head_kv,
+        uint32_t         n_head_dim,
+        uint32_t         n_value_dim,
+        uint32_t         n_rot,
+        uint32_t         n_lora_q,
+        uint32_t         n_lora_o,
+        uint32_t         n_out_group,
+        uint32_t         n_expert,
+        uint32_t         n_expert_used,
+        uint32_t         n_ff_exp,
+        uint32_t         n_expert_shared,
+        uint32_t         n_hash_layer,
+        uint32_t         n_swa,
+        uint32_t         n_indexer_head,
+        uint32_t         n_indexer_head_dim,
+        uint32_t         n_indexer_top_k,
+        uint32_t         n_hc,
+        uint32_t         n_hc_sinkhorn_iter) {
+    ds4_str arch_str = {0};
+    model_get_string(m, "general.architecture", &arch_str);
+    if (arch_str.len == 5 && memcmp(arch_str.ptr, "qwen2", 5) == 0) {
+        *out_arch = DS4_ARCH_QWEN3_CODER;
+        g_ds4_shape = DS4_SHAPE_FLASH;
+        g_ds4_shape.name = "Qwen3 Coder";
+        g_ds4_shape.variant = DS4_VARIANT_PRO;
+        g_ds4_shape.n_layer = 48;
+        g_ds4_shape.n_expert = 512;
+        g_ds4_shape.n_expert_used = 10;
+        g_ds4_shape.n_expert_shared = 1;
+        
+        ds4_array_ref tokens_arr;
+        if (model_get_array(m, "tokenizer.ggml.tokens", &tokens_arr)) {
+            g_ds4_shape.n_vocab = (uint32_t)tokens_arr.len;
+        } else {
+            g_ds4_shape.n_vocab = n_vocab;
+        }
+        return;
+    }
+
+    *out_arch = DS4_ARCH_DEEPSEEK;
+
     if (ds4_shape_matches_metadata(&DS4_SHAPE_FLASH,
                                    n_layer, n_embd, n_vocab, n_head, n_head_kv,
                                    n_head_dim, n_value_dim, n_rot, n_lora_q,
@@ -3885,7 +3910,15 @@ static void config_validate_fixed_shape(uint32_t n_layer) {
 
 /* Validate metadata values that affect semantics: attention shape, HC count,
  * expert routing, RoPE scaling, compression ratios, and SwiGLU clamp. */
-static void config_validate_model(const ds4_model *m) {
+static void config_validate_model(const ds4_model *m, ds_arch_type *out_arch) {
+    // First check general.architecture directly
+    ds4_str arch_str = {0};
+    model_get_string(m, "general.architecture", &arch_str);
+    if (arch_str.len == 5 && memcmp(arch_str.ptr, "qwen2", 5) == 0) {
+        ds4_select_shape_from_metadata(m, out_arch, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        return;
+    }
+
     const uint32_t n_layer = required_u32(m, "deepseek4.block_count");
     const uint32_t n_embd = required_u32(m, "deepseek4.embedding_length");
     const uint32_t n_vocab = required_u32(m, "deepseek4.vocab_size");
@@ -3913,7 +3946,9 @@ static void config_validate_model(const ds4_model *m) {
     const uint32_t n_hc = required_u32(m, "deepseek4.hyper_connection.count");
     const uint32_t n_hc_sinkhorn_iter = required_u32(m, "deepseek4.hyper_connection.sinkhorn_iterations");
 
-    ds4_select_shape_from_metadata(n_layer,
+    ds4_select_shape_from_metadata(m,
+                                   out_arch,
+                                   n_layer,
                                    n_embd,
                                    n_vocab,
                                    n_head,
@@ -21812,6 +21847,7 @@ struct ds4_engine {
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
     ds4_backend backend;
+    ds_arch_type arch;
     int mtp_draft_tokens;
     float mtp_margin;
     char *directional_steering_file;
@@ -25606,7 +25642,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
-    config_validate_model(&e->model);
+    config_validate_model(&e->model, &e->arch);
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
         fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
         ds4_engine_close(e);
@@ -25627,6 +25663,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     "ds4: expert profile/hotlist is Metal-only for now; ignoring for %s backend\n",
                     ds4_backend_name(e->backend));
         }
+    }
+    if (opt->inspect_only) {
+        *out = e;
+        return 0;
     }
     weights_bind(&e->weights,
                  &e->model,
@@ -25669,10 +25709,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 (double)e->ssd_streaming_cache_bytes / 1073741824.0,
                 (double)per_expert_bytes / 1048576.0,
                 budget);
-    }
-    if (opt->inspect_only) {
-        *out = e;
-        return 0;
     }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
@@ -26014,7 +26050,9 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
 }
 
 int ds4_engine_model_id(ds4_engine *e) {
-    (void)e;
+    if (e && e->arch == DS4_ARCH_QWEN3_CODER) {
+        return 2;
+    }
     return (int)DS4_MODEL_VARIANT;
 }
 
