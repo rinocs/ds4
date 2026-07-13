@@ -137,6 +137,8 @@ static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
+static id<MTLComputePipelineState> g_qwen3_gated_attention_pipeline;
+static id<MTLComputePipelineState> g_qwen3_deltanet_pipeline;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
 static NSMutableDictionary<NSString *, DS4MetalQ4ExpertTable *> *g_q4_expert_table_cache;
@@ -3046,6 +3048,7 @@ static NSString *ds4_gpu_full_source(void) {
      */
     NSArray<NSArray<NSString *> *> *required_sources = @[
         @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"metal/flash_attn.metal"],
+        @[@"DS4_METAL_QWEN3_ATTN_SOURCE", @"metal/qwen3_attn.metal"],
         @[@"DS4_METAL_DENSE_SOURCE",      @"metal/dense.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
         @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
@@ -6767,6 +6770,8 @@ void ds4_gpu_cleanup(void) {
         g_moe_table_q4_pair_up_encoder = nil;
         g_moe_table_q4_sum_down_encoder = nil;
         g_rope_tail_batch_pipeline = nil;
+        g_qwen3_gated_attention_pipeline = nil;
+        g_qwen3_deltanet_pipeline = nil;
         g_dsv4_fp8_kv_quantize_pipeline = nil;
         g_dsv4_indexer_qat_pipeline = nil;
         g_dsv4_kv_fp8_store_pipeline = nil;
@@ -26816,4 +26821,36 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
     }
 
     return 1;
+}
+
+bool metal_bind_qwen3_kernels(void) {
+    if (!g_initialized && !ds4_gpu_init()) return false;
+    if (!g_library) return false;
+
+    NSError *error = nil;
+    id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_qwen3_gated_attention"];
+    if (!fn) {
+        fprintf(stderr, "ds4: Metal kernel_qwen3_gated_attention function not found\n");
+        return false;
+    }
+    g_qwen3_gated_attention_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!g_qwen3_gated_attention_pipeline) {
+        fprintf(stderr, "ds4: Metal kernel_qwen3_gated_attention pipeline failed: %s\n",
+                [[error localizedDescription] UTF8String]);
+        return false;
+    }
+
+    fn = [g_library newFunctionWithName:@"kernel_qwen3_deltanet"];
+    if (!fn) {
+        fprintf(stderr, "ds4: Metal kernel_qwen3_deltanet function not found\n");
+        return false;
+    }
+    g_qwen3_deltanet_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!g_qwen3_deltanet_pipeline) {
+        fprintf(stderr, "ds4: Metal kernel_qwen3_deltanet pipeline failed: %s\n",
+                [[error localizedDescription] UTF8String]);
+        return false;
+    }
+
+    return true;
 }

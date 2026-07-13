@@ -1017,6 +1017,8 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+bool metal_bind_qwen3_kernels(void);
+
 #ifdef __cplusplus
 }
 #endif
