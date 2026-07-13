@@ -2245,10 +2245,12 @@ static void test_qwen3_shape_dispatch(void) {
 }
 
 #ifndef DS4_NO_GPU
+#ifdef __APPLE__
 static void test_qwen3_attention_kernels(void) {
     bool ok = metal_bind_qwen3_kernels();
     TEST_ASSERT(ok == true);
 }
+#endif
 #endif
 
 typedef void (*test_fn)(void);
@@ -2273,7 +2275,9 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
+#ifdef __APPLE__
     {"--qwen3-attention-kernels", "qwen3-attention-kernels", "verify Qwen3 hybrid attention Metal kernels load and compile", test_qwen3_attention_kernels},
+#endif
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--qwen3-shape-dispatch", "qwen3-shape-dispatch", "assert engine parses mock GGUF for Qwen3 and identifies model_id == 2", test_qwen3_shape_dispatch},
