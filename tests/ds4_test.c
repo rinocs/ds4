@@ -2189,6 +2189,7 @@ static void write_gguf_str(FILE *f, const char *s) {
 static void create_mock_qwen3_gguf(const char *path) {
     FILE *f = fopen(path, "wb");
     TEST_ASSERT(f != NULL);
+    if (f == NULL) return;
 
     uint32_t magic = 0x46554747; // "GGUF"
     uint32_t version = 3;
