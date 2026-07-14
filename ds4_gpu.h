@@ -1019,6 +1019,27 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 
 bool metal_bind_qwen3_kernels(void);
 
+#ifdef __APPLE__
+int ds4_gpu_qwen3_gated_attention(
+    ds4_gpu_tensor *src,
+    ds4_gpu_tensor *gate,
+    ds4_gpu_tensor *dst,
+    uint32_t n_elements
+);
+
+int ds4_gpu_qwen3_deltanet(
+    ds4_gpu_tensor *q,
+    ds4_gpu_tensor *k,
+    ds4_gpu_tensor *v,
+    ds4_gpu_tensor *beta,
+    ds4_gpu_tensor *state,
+    ds4_gpu_tensor *dst,
+    uint32_t n_tokens,
+    uint32_t n_heads,
+    uint32_t head_dim
+);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

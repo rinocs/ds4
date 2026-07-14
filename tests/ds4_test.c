@@ -2249,6 +2249,180 @@ static void test_qwen3_shape_dispatch(void) {
 static void test_qwen3_attention_kernels(void) {
     bool ok = metal_bind_qwen3_kernels();
     TEST_ASSERT(ok == true);
+
+    // 1. Verify kernel_qwen3_gated_attention
+    {
+        uint32_t n_elements = 64;
+        float *src_host = malloc(n_elements * sizeof(float));
+        float *gate_host = malloc(n_elements * sizeof(float));
+        float *dst_host = malloc(n_elements * sizeof(float));
+        float *ref_dst = malloc(n_elements * sizeof(float));
+        TEST_ASSERT(src_host != NULL && gate_host != NULL && dst_host != NULL && ref_dst != NULL);
+
+        for (uint32_t i = 0; i < n_elements; i++) {
+            src_host[i] = (float)((i * 3 + 1) % 13 - 6) / 5.0f;
+            gate_host[i] = (float)((i * 7 + 2) % 11 - 5) / 3.0f;
+            ref_dst[i] = src_host[i] * (1.0f / (1.0f + expf(-gate_host[i])));
+        }
+
+        ds4_gpu_tensor *src_gpu = ds4_gpu_tensor_alloc(n_elements * sizeof(float));
+        ds4_gpu_tensor *gate_gpu = ds4_gpu_tensor_alloc(n_elements * sizeof(float));
+        ds4_gpu_tensor *dst_gpu = ds4_gpu_tensor_alloc(n_elements * sizeof(float));
+        TEST_ASSERT(src_gpu != NULL && gate_gpu != NULL && dst_gpu != NULL);
+
+        TEST_ASSERT(ds4_gpu_tensor_write(src_gpu, 0, src_host, n_elements * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(gate_gpu, 0, gate_host, n_elements * sizeof(float)) != 0);
+
+        int rc = ds4_gpu_qwen3_gated_attention(src_gpu, gate_gpu, dst_gpu, n_elements);
+        TEST_ASSERT(rc != 0);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(dst_gpu, 0, dst_host, n_elements * sizeof(float)) != 0);
+
+        float max_err = 0.0f;
+        for (uint32_t i = 0; i < n_elements; i++) {
+            float err = fabsf(dst_host[i] - ref_dst[i]);
+            if (err > max_err) max_err = err;
+        }
+        TEST_ASSERT(max_err < 1e-5f);
+
+        ds4_gpu_tensor_free(src_gpu);
+        ds4_gpu_tensor_free(gate_gpu);
+        ds4_gpu_tensor_free(dst_gpu);
+        free(src_host);
+        free(gate_host);
+        free(dst_host);
+        free(ref_dst);
+    }
+
+    // 2. Verify kernel_qwen3_deltanet
+    {
+        uint32_t n_tokens = 4;
+        uint32_t n_heads = 2;
+        uint32_t head_dim = 16;
+
+        uint32_t size_tokens = n_tokens * n_heads * head_dim;
+        uint32_t size_state = n_heads * head_dim * head_dim;
+
+        float *q_host = malloc(size_tokens * sizeof(float));
+        float *k_host = malloc(size_tokens * sizeof(float));
+        float *v_host = malloc(size_tokens * sizeof(float));
+        float *beta_host = malloc(size_tokens * sizeof(float));
+        float *state_host = malloc(size_state * sizeof(float));
+        float *dst_host = malloc(size_tokens * sizeof(float));
+        float *state_out_host = malloc(size_state * sizeof(float));
+
+        float *ref_state = malloc(size_state * sizeof(float));
+        float *ref_dst = malloc(size_tokens * sizeof(float));
+
+        TEST_ASSERT(q_host != NULL && k_host != NULL && v_host != NULL && beta_host != NULL);
+        TEST_ASSERT(state_host != NULL && dst_host != NULL && state_out_host != NULL);
+        TEST_ASSERT(ref_state != NULL && ref_dst != NULL);
+
+        for (uint32_t i = 0; i < size_tokens; i++) {
+            q_host[i] = (float)((i * 3 + 1) % 17 - 8) / 10.0f;
+            k_host[i] = (float)((i * 7 + 2) % 19 - 9) / 10.0f;
+            v_host[i] = (float)((i * 11 + 3) % 23 - 11) / 10.0f;
+            beta_host[i] = (float)((i * 5 + 4) % 13) / 12.0f;
+        }
+        for (uint32_t i = 0; i < size_state; i++) {
+            state_host[i] = (float)((i * 13 + 5) % 29 - 14) / 20.0f;
+        }
+
+        memcpy(ref_state, state_host, size_state * sizeof(float));
+
+        // CPU computation reference
+        for (uint32_t h = 0; h < n_heads; h++) {
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                uint32_t token_off = t * n_heads * head_dim + h * head_dim;
+                uint32_t state_off = h * head_dim * head_dim;
+
+                // u_t = S_{t-1} k_t
+                float u[128] = {0};
+                for (uint32_t r = 0; r < head_dim; r++) {
+                    float sum = 0.0f;
+                    for (uint32_t c = 0; c < head_dim; c++) {
+                        sum += ref_state[state_off + r * head_dim + c] * k_host[token_off + c];
+                    }
+                    u[r] = sum;
+                }
+
+                // S_t = S_{t-1} + beta_t (v_t - u_t) k_t^T
+                for (uint32_t r = 0; r < head_dim; r++) {
+                    float diff = v_host[token_off + r] - u[r];
+                    float b = beta_host[token_off + r];
+                    for (uint32_t c = 0; c < head_dim; c++) {
+                        ref_state[state_off + r * head_dim + c] += b * diff * k_host[token_off + c];
+                    }
+                }
+
+                // o_t = S_t q_t
+                for (uint32_t r = 0; r < head_dim; r++) {
+                    float sum = 0.0f;
+                    for (uint32_t c = 0; c < head_dim; c++) {
+                        sum += ref_state[state_off + r * head_dim + c] * q_host[token_off + c];
+                    }
+                    ref_dst[token_off + r] = sum;
+                }
+            }
+        }
+
+        ds4_gpu_tensor *q_gpu = ds4_gpu_tensor_alloc(size_tokens * sizeof(float));
+        ds4_gpu_tensor *k_gpu = ds4_gpu_tensor_alloc(size_tokens * sizeof(float));
+        ds4_gpu_tensor *v_gpu = ds4_gpu_tensor_alloc(size_tokens * sizeof(float));
+        ds4_gpu_tensor *beta_gpu = ds4_gpu_tensor_alloc(size_tokens * sizeof(float));
+        ds4_gpu_tensor *state_gpu = ds4_gpu_tensor_alloc(size_state * sizeof(float));
+        ds4_gpu_tensor *dst_gpu = ds4_gpu_tensor_alloc(size_tokens * sizeof(float));
+
+        TEST_ASSERT(q_gpu != NULL && k_gpu != NULL && v_gpu != NULL && beta_gpu != NULL);
+        TEST_ASSERT(state_gpu != NULL && dst_gpu != NULL);
+
+        TEST_ASSERT(ds4_gpu_tensor_write(q_gpu, 0, q_host, size_tokens * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(k_gpu, 0, k_host, size_tokens * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(v_gpu, 0, v_host, size_tokens * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(beta_gpu, 0, beta_host, size_tokens * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(state_gpu, 0, state_host, size_state * sizeof(float)) != 0);
+
+        int rc = ds4_gpu_qwen3_deltanet(
+            q_gpu, k_gpu, v_gpu, beta_gpu, state_gpu, dst_gpu,
+            n_tokens, n_heads, head_dim
+        );
+        TEST_ASSERT(rc != 0);
+
+        TEST_ASSERT(ds4_gpu_tensor_read(dst_gpu, 0, dst_host, size_tokens * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(state_gpu, 0, state_out_host, size_state * sizeof(float)) != 0);
+
+        float max_err_dst = 0.0f;
+        for (uint32_t i = 0; i < size_tokens; i++) {
+            float err = fabsf(dst_host[i] - ref_dst[i]);
+            if (err > max_err_dst) max_err_dst = err;
+        }
+
+        float max_err_state = 0.0f;
+        for (uint32_t i = 0; i < size_state; i++) {
+            float err = fabsf(state_out_host[i] - ref_state[i]);
+            if (err > max_err_state) max_err_state = err;
+        }
+
+        TEST_ASSERT(max_err_dst < 1e-4f);
+        TEST_ASSERT(max_err_state < 1e-4f);
+
+        ds4_gpu_tensor_free(q_gpu);
+        ds4_gpu_tensor_free(k_gpu);
+        ds4_gpu_tensor_free(v_gpu);
+        ds4_gpu_tensor_free(beta_gpu);
+        ds4_gpu_tensor_free(state_gpu);
+        ds4_gpu_tensor_free(dst_gpu);
+
+        free(q_host);
+        free(k_host);
+        free(v_host);
+        free(beta_host);
+        free(state_host);
+        free(dst_host);
+        free(state_out_host);
+        free(ref_state);
+        free(ref_dst);
+    }
 }
 #endif
 #endif

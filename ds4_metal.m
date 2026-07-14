@@ -26854,3 +26854,83 @@ bool metal_bind_qwen3_kernels(void) {
 
     return true;
 }
+
+int ds4_gpu_qwen3_gated_attention(
+    ds4_gpu_tensor *src,
+    ds4_gpu_tensor *gate,
+    ds4_gpu_tensor *dst,
+    uint32_t n_elements
+) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_qwen3_gated_attention_pipeline) return 0;
+
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+
+        [enc setComputePipelineState:g_qwen3_gated_attention_pipeline];
+        [enc setBuffer:ds4_gpu_tensor_obj(src).buffer offset:ds4_gpu_tensor_offset(src) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_obj(gate).buffer offset:ds4_gpu_tensor_offset(gate) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_obj(dst).buffer offset:ds4_gpu_tensor_offset(dst) atIndex:2];
+        [enc setBytes:&n_elements length:sizeof(n_elements) atIndex:3];
+
+        NSUInteger w = g_qwen3_gated_attention_pipeline.threadExecutionWidth;
+        MTLSize threadsPerThreadgroup = MTLSizeMake(w, 1, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake((n_elements + w - 1) / w, 1, 1);
+        [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen3 Gated Attention Post-Processing")) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_qwen3_deltanet(
+    ds4_gpu_tensor *q,
+    ds4_gpu_tensor *k,
+    ds4_gpu_tensor *v,
+    ds4_gpu_tensor *beta,
+    ds4_gpu_tensor *state,
+    ds4_gpu_tensor *dst,
+    uint32_t n_tokens,
+    uint32_t n_heads,
+    uint32_t head_dim
+) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_qwen3_deltanet_pipeline) return 0;
+
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+
+        [enc setComputePipelineState:g_qwen3_deltanet_pipeline];
+        [enc setBuffer:ds4_gpu_tensor_obj(q).buffer offset:ds4_gpu_tensor_offset(q) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_obj(k).buffer offset:ds4_gpu_tensor_offset(k) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_obj(v).buffer offset:ds4_gpu_tensor_offset(v) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_obj(beta).buffer offset:ds4_gpu_tensor_offset(beta) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_obj(state).buffer offset:ds4_gpu_tensor_offset(state) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_obj(dst).buffer offset:ds4_gpu_tensor_offset(dst) atIndex:5];
+        [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:6];
+        [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:7];
+        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:8];
+
+        NSUInteger threads = head_dim;
+        if (threads < 32) threads = 32;
+        if (threads > 128) threads = 128;
+        MTLSize threadsPerThreadgroup = MTLSizeMake(threads, 1, 1);
+        MTLSize threadgroupsPerGrid = MTLSizeMake(n_heads, 1, 1);
+        [enc dispatchThreadgroups:threadgroupsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen3 DeltaNet Recurrent Update")) return 0;
+    }
+    return 1;
+}
