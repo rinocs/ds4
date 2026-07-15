@@ -2244,6 +2244,91 @@ static void test_qwen3_shape_dispatch(void) {
     remove(temp_path);
 }
 
+static void test_qwen3_moe_routing(void) {
+    uint64_t recommended = 16ULL * 1024 * 1024 * 1024;
+    uint64_t non_routed = 8ULL * 1024 * 1024 * 1024;
+    uint64_t per_expert = 100ULL * 1024 * 1024;
+    uint64_t max_experts = 48 * 512;
+    ds4_ssd_cache_plan plan;
+
+    bool ok = ds4_ssd_auto_cache_plan(recommended, non_routed, per_expert, max_experts, &plan);
+    TEST_ASSERT(ok);
+    TEST_ASSERT(plan.cache_experts > 0);
+    TEST_ASSERT(plan.cache_experts <= max_experts);
+
+    uint32_t parsed_experts = 0;
+    uint64_t parsed_bytes = 0;
+    ok = ds4_parse_streaming_cache_experts_arg("20", &parsed_experts, &parsed_bytes);
+    TEST_ASSERT(ok);
+    TEST_ASSERT(parsed_experts == 20);
+    TEST_ASSERT(parsed_bytes == 0);
+
+    ok = ds4_parse_streaming_cache_experts_arg("32GB", &parsed_experts, &parsed_bytes);
+    TEST_ASSERT(ok);
+    TEST_ASSERT(parsed_experts == 0);
+    TEST_ASSERT(parsed_bytes == 32ULL * 1024 * 1024 * 1024);
+}
+
+static void test_qwen3_distributed_validation(void) {
+    ds4_dist_options *opt = ds4_dist_options_create();
+    TEST_ASSERT(opt != NULL);
+    TEST_ASSERT(opt->role == DS4_DISTRIBUTED_NONE);
+
+    char err[256];
+    
+    // Test case 1: Parse coordinator args
+    {
+        char *argv[] = {"--role", "coordinator", "--layers", "0:20", "--listen", "127.0.0.1", "8080"};
+        int argc = sizeof(argv) / sizeof(argv[0]);
+        for (int index = 0; index < argc; index++) {
+            int rc = ds4_dist_parse_cli_arg(argv[index], &index, argc, argv, opt, err, sizeof(err));
+            TEST_ASSERT(rc == DS4_DIST_CLI_MATCHED);
+        }
+        TEST_ASSERT(opt->role == DS4_DISTRIBUTED_COORDINATOR);
+        TEST_ASSERT(opt->layers.start == 0);
+        TEST_ASSERT(opt->layers.end == 20);
+        TEST_ASSERT(opt->layers.set == true);
+        TEST_ASSERT(strcmp(opt->listen_host, "127.0.0.1") == 0);
+        TEST_ASSERT(opt->listen_port == 8080);
+    }
+
+    // Reset options
+    ds4_dist_options_free(opt);
+    opt = ds4_dist_options_create();
+
+    // Test case 2: Parse worker args
+    {
+        char *argv[] = {"--role", "worker", "--layers", "21:output", "--coordinator", "127.0.0.1", "8080"};
+        int argc = sizeof(argv) / sizeof(argv[0]);
+        for (int index = 0; index < argc; index++) {
+            int rc = ds4_dist_parse_cli_arg(argv[index], &index, argc, argv, opt, err, sizeof(err));
+            TEST_ASSERT(rc == DS4_DIST_CLI_MATCHED);
+        }
+        TEST_ASSERT(opt->role == DS4_DISTRIBUTED_WORKER);
+        TEST_ASSERT(opt->layers.start == 21);
+        TEST_ASSERT(opt->layers.end == UINT32_MAX); // "output" boundary
+        TEST_ASSERT(opt->layers.has_output == true);
+        TEST_ASSERT(opt->layers.set == true);
+        TEST_ASSERT(strcmp(opt->coordinator_host, "127.0.0.1") == 0);
+        TEST_ASSERT(opt->coordinator_port == 8080);
+    }
+
+    // Reset options
+    ds4_dist_options_free(opt);
+    opt = ds4_dist_options_create();
+
+    // Test case 3: Parse invalid role
+    {
+        int index = 0;
+        char *argv[] = {"--role", "invalid_role"};
+        int argc = sizeof(argv) / sizeof(argv[0]);
+        int rc = ds4_dist_parse_cli_arg(argv[0], &index, argc, argv, opt, err, sizeof(err));
+        TEST_ASSERT(rc == DS4_DIST_CLI_ERROR);
+    }
+
+    ds4_dist_options_free(opt);
+}
+
 #ifndef DS4_NO_GPU
 #ifdef __APPLE__
 static void test_qwen3_attention_kernels(void) {
@@ -2455,6 +2540,8 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
     {"--qwen3-shape-dispatch", "qwen3-shape-dispatch", "assert engine parses mock GGUF for Qwen3 and identifies model_id == 2", test_qwen3_shape_dispatch},
+    {"--qwen3-moe-routing", "qwen3-moe-routing", "verify Qwen3 MoE routing limits and cache planning logic", test_qwen3_moe_routing},
+    {"--qwen3-distributed-validation", "qwen3-distributed-validation", "verify distributed orchestration option parsing and constraints", test_qwen3_distributed_validation},
 };
 
 static void test_print_help(const char *prog) {

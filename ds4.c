@@ -119,8 +119,8 @@ enum {
     DS4_MAX_OUT_GROUP        = 16,
     DS4_MAX_LORA_Q           = 1536,
     DS4_MAX_LORA_O           = 1024,
-    DS4_MAX_EXPERT           = 384,
-    DS4_MAX_EXPERT_USED      = 6,
+    DS4_MAX_EXPERT           = 512,
+    DS4_MAX_EXPERT_USED      = 10,
     DS4_MAX_EXPERT_SHARED    = 1,
     DS4_MAX_FF_EXP           = 3072,
     DS4_MAX_HASH_LAYER       = 3,
@@ -757,7 +757,7 @@ static double now_sec(void) {
 enum { DS4_EXPERT_PROFILE_MAX_CAPS = 10 };
 
 static const uint32_t ds4_expert_profile_cap_candidates[DS4_EXPERT_PROFILE_MAX_CAPS] = {
-    1, 2, 4, 8, 16, 32, 64, 128, 256, 384
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512
 };
 
 typedef struct {
@@ -4181,7 +4181,7 @@ static uint32_t model_map_q4_pro_group_views(void) {
     if (env && env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(env, &end, 10);
-        if (end != env && *end == '\0' && v > 0 && v <= 384 && (384u % (uint32_t)v) == 0) {
+        if (end != env && *end == '\0' && v > 0 && v <= DS4_N_EXPERT && ((uint32_t)DS4_N_EXPERT % (uint32_t)v) == 0) {
             views = (uint32_t)v;
         }
     }
@@ -4194,7 +4194,7 @@ static void model_map_span_vec_include_one(ds4_model_map_span_vec *spans, const 
     const uint32_t q4_pro_group_views = model_map_q4_pro_group_views();
     if (t->type == DS4_TENSOR_Q4_K &&
         t->ndim == 3 &&
-        t->dim[2] == 384 &&
+        t->dim[2] == DS4_N_EXPERT &&
         t->bytes >= q4_isolated_min_bytes &&
         (t->bytes % q4_pro_group_views) == 0)
     {
@@ -11086,13 +11086,24 @@ static bool metal_graph_alloc_raw_cap(
     g->qr = ds4_gpu_tensor_alloc(q_rank * sizeof(float));
     g->qr_norm = ds4_gpu_tensor_alloc(q_rank * sizeof(float));
     g->q = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
-    g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-    g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
+    const bool is_qwen3 = (strcmp(g_ds4_shape.name, "Qwen3 Coder") == 0);
+    g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)(is_qwen3 ? q_dim : DS4_N_HEAD_DIM) * sizeof(float));
+    g->kv = ds4_gpu_tensor_alloc((uint64_t)(is_qwen3 ? q_dim : DS4_N_HEAD_DIM) * sizeof(float));
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
-                (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
+                (uint64_t)raw_cap * DS4_N_HEAD_DIM * (is_qwen3 ? 2 : 1) * sizeof(float));
+        if (is_qwen3) {
+            const bool is_deltanet = (il + 1) % 4 != 0;
+            if (is_deltanet) {
+                g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * DS4_N_HEAD_DIM * sizeof(float));
+                if (g->layer_attn_state_kv[il]) {
+                    state_init_ok = state_init_ok &&
+                                    metal_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * DS4_N_HEAD_DIM);
+                }
+            }
+        }
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -11144,8 +11155,8 @@ static bool metal_graph_alloc_raw_cap(
             }
         }
     }
-    g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
-    g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
+    g->comp_kv_cur = ds4_gpu_tensor_alloc((is_qwen3 ? q_dim : comp_width_max) * sizeof(float));
+    g->comp_sc_cur = ds4_gpu_tensor_alloc((is_qwen3 ? q_dim : comp_width_max) * sizeof(float));
     if (DS4_GPU_ATTN_COMP_CACHE_F16) {
         g->attn_comp_stage = ds4_gpu_tensor_alloc((uint64_t)g->attn_comp_stage_cap *
                                                   DS4_N_HEAD_DIM * sizeof(float));
@@ -11217,10 +11228,10 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_qr_norm = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_q = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
     g->batch_q_half = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
-    g->batch_kv_raw = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
-    g->batch_kv = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
-    g->batch_comp_kv = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
-    g->batch_comp_sc = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
+    g->batch_kv_raw = ds4_gpu_tensor_alloc(pc * (is_qwen3 ? q_dim : DS4_N_HEAD_DIM) * sizeof(float));
+    g->batch_kv = ds4_gpu_tensor_alloc(pc * (is_qwen3 ? q_dim : DS4_N_HEAD_DIM) * sizeof(float));
+    g->batch_comp_kv = ds4_gpu_tensor_alloc(pc * (is_qwen3 ? q_dim : comp_width_max) * sizeof(float));
+    g->batch_comp_sc = ds4_gpu_tensor_alloc(pc * (is_qwen3 ? q_dim : comp_width_max) * sizeof(float));
     g->batch_indexer_q = ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
     g->batch_indexer_weights = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
     g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
@@ -11635,6 +11646,7 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         const ds4_gpu_graph *g,
         const ds4_weights   *weights,
         uint32_t             n_tokens) {
+    const bool is_qwen3 = (strcmp(DS4_MODEL_SHAPE_NAME, "Qwen3 Coder") == 0);
     if (!g ||
         !g->ssd_streaming ||
         g->quality ||
@@ -11645,10 +11657,19 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
         getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
         DS4_N_LAYER == 0 ||
-        DS4_N_EXPERT_USED != 6 ||
-        weights->layer[0].ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
-        weights->layer[0].ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
-        weights->layer[0].ffn_down_exps->type != DS4_TENSOR_Q2_K) {
+        (DS4_N_EXPERT_USED != 6 && !(is_qwen3 && DS4_N_EXPERT_USED == 10))) {
+        return false;
+    }
+
+    const bool expert_type_ok =
+        (weights->layer[0].ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+         weights->layer[0].ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+         weights->layer[0].ffn_down_exps->type == DS4_TENSOR_Q2_K) ||
+        (is_qwen3 &&
+         weights->layer[0].ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+         weights->layer[0].ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+         weights->layer[0].ffn_down_exps->type == DS4_TENSOR_Q4_K);
+    if (!expert_type_ok) {
         return false;
     }
 
@@ -11672,6 +11693,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
         const ds4_weights   *weights,
         uint32_t             n_tokens) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const bool is_qwen3 = (strcmp(DS4_MODEL_SHAPE_NAME, "Qwen3 Coder") == 0);
     if (!g ||
         !g->ssd_streaming ||
         g->quality ||
@@ -11684,7 +11706,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
         DS4_N_LAYER == 0 ||
         DS4_N_EXPERT < 128 ||
-        DS4_N_EXPERT_USED != 6) {
+        (DS4_N_EXPERT_USED != 6 && !(is_qwen3 && DS4_N_EXPERT_USED == 10))) {
         return false;
     }
 
@@ -11732,18 +11754,21 @@ static bool rocm_graph_stream_prefill_full_layer_enabled(
         const ds4_gpu_graph      *g,
         const ds4_layer_weights  *layer,
         uint32_t                  n_tokens) {
-    return g &&
-           g->ssd_streaming &&
-           !g->quality &&
-           layer &&
-           n_tokens >= DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MIN_TOKENS &&
-           DS4_N_EXPERT_USED == 6 &&
-           layer->ffn_gate_exps &&
-           layer->ffn_up_exps &&
-           layer->ffn_down_exps &&
-           layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
-           layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-           layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    const bool is_qwen3 = (strcmp(g_ds4_shape.name, "Qwen3 Coder") == 0);
+    if (!g || !g->ssd_streaming || g->quality || !layer || !layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps) {
+        return false;
+    }
+    const bool expert_type_ok =
+        (layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K) ||
+        (is_qwen3 &&
+         layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+         layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+         layer->ffn_down_exps->type == DS4_TENSOR_Q4_K);
+    return n_tokens >= DS4_ROCM_STREAM_PREFILL_FULL_LAYER_MIN_TOKENS &&
+           (DS4_N_EXPERT_USED == 6 || (is_qwen3 && DS4_N_EXPERT_USED == 10)) &&
+           expert_type_ok;
 }
 
 static uint32_t rocm_graph_stream_prefill_full_layer_seed_tokens(void) {
@@ -13723,6 +13748,7 @@ static bool metal_graph_decode_cpu_router_applicable(
         layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+    const bool is_qwen3 = (strcmp(DS4_MODEL_SHAPE_NAME, "Qwen3 Coder") == 0);
     const bool streaming_iq2 =
         g &&
         g->ssd_streaming &&
@@ -13732,7 +13758,7 @@ static bool metal_graph_decode_cpu_router_applicable(
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
-        DS4_N_EXPERT_USED == 6 &&
+        (DS4_N_EXPERT_USED == 6 || (is_qwen3 && DS4_N_EXPERT_USED == 10)) &&
         DS4_N_EXPERT >= 128 &&
         getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
@@ -13746,14 +13772,16 @@ static bool metal_graph_decode_pro_q4_expert_table_expected(
         uint64_t                 gate_tensor_bytes,
         uint64_t                 down_tensor_bytes) {
     const uint64_t q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
+    const bool is_qwen3 = (strcmp(DS4_MODEL_SHAPE_NAME, "Qwen3 Coder") == 0);
+    const bool shape_ok = (DS4_N_EXPERT == 384 && DS4_N_EXPERT_USED == 6) ||
+                           (is_qwen3 && DS4_N_EXPERT == 512 && DS4_N_EXPERT_USED == 10);
     return !g->quality &&
            DS4_MODEL_VARIANT == DS4_VARIANT_PRO &&
            metal_graph_q4_selected_paths_allowed(g) &&
            layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
            layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
            layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-           DS4_N_EXPERT == 384 &&
-           DS4_N_EXPERT_USED == 6 &&
+           shape_ok &&
            gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
            down_tensor_bytes >= q4_selected_min_tensor_bytes &&
            getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
@@ -13774,13 +13802,13 @@ static bool metal_graph_decode_q4_selected_slots_expected(
                                                         down_tensor_bytes)) {
         return false;
     }
-    const uint64_t q4_selected_min_tensor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
+    const bool is_qwen3 = (strcmp(DS4_MODEL_SHAPE_NAME, "Qwen3 Coder") == 0);
     return !g->quality &&
            metal_graph_q4_selected_paths_allowed(g) &&
            layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
            layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
            layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-           DS4_N_EXPERT_USED == 6 &&
+           (DS4_N_EXPERT_USED == 6 || (is_qwen3 && DS4_N_EXPERT_USED == 10)) &&
            DS4_N_EXPERT >= 128 &&
            (g->ssd_streaming ||
             (gate_tensor_bytes >= q4_selected_min_tensor_bytes &&
@@ -13793,13 +13821,14 @@ static bool metal_graph_decode_q4_selected_slots_expected(
 static bool metal_graph_decode_iq2_selected_slots_expected(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
+    const bool is_qwen3 = (strcmp(DS4_MODEL_SHAPE_NAME, "Qwen3 Coder") == 0);
     return g &&
            g->ssd_streaming &&
            !g->quality &&
            layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
            layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
            layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
-           DS4_N_EXPERT_USED == 6 &&
+           (DS4_N_EXPERT_USED == 6 || (is_qwen3 && DS4_N_EXPERT_USED == 10)) &&
            DS4_N_EXPERT >= 128 &&
            getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
            getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
@@ -13810,6 +13839,7 @@ static bool metal_graph_decode_cuda_selected_slots_expected(
         const ds4_gpu_graph     *g,
         const ds4_layer_weights *layer) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    const bool is_qwen3 = (strcmp(DS4_MODEL_SHAPE_NAME, "Qwen3 Coder") == 0);
     if (!g ||
         !g->ssd_streaming ||
         g->quality ||
@@ -13817,7 +13847,7 @@ static bool metal_graph_decode_cuda_selected_slots_expected(
         !layer->ffn_gate_exps ||
         !layer->ffn_up_exps ||
         !layer->ffn_down_exps ||
-        DS4_N_EXPERT_USED != 6 ||
+        (DS4_N_EXPERT_USED != 6 && !(is_qwen3 && DS4_N_EXPERT_USED == 10)) ||
         DS4_N_EXPERT < 128 ||
         getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL) {
@@ -14979,8 +15009,62 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
-    bool qkv_pair_projected = false;
-    if (ok && qkv_rms_fused) {
+    const bool is_qwen3 = (strcmp(g_ds4_shape.name, "Qwen3 Coder") == 0);
+    if (ok && is_qwen3) {
+#ifdef __APPLE__
+        const bool is_deltanet = (il + 1) % 4 != 0;
+        const uint64_t kv_dim = is_deltanet ? q_dim : (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+
+        // 1. Projections
+        ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size, layer->attn_q_a->abs_offset, DS4_N_EMBD, q_dim, g->attn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size, layer->attn_q_b->abs_offset, DS4_N_EMBD, kv_dim, g->attn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv, model->map, model->size, layer->attn_kv->abs_offset, DS4_N_EMBD, kv_dim, g->attn_norm, 1) != 0;
+        if (ok) ok = metal_graph_matmul_plain_tensor(g->comp_kv_cur, model, layer->attn_compressor_gate, DS4_N_EMBD, q_dim, g->attn_norm, 1);
+
+        if (is_deltanet) {
+            // DeltaNet linear attention decode step
+            if (ok) ok = ds4_gpu_qwen3_deltanet(
+                g->q, g->kv_raw, g->kv, g->comp_kv_cur, g->layer_attn_state_kv[il], g->heads,
+                1, DS4_N_HEAD, DS4_N_HEAD_DIM
+            ) != 0;
+        } else {
+            // Gated Attention decode step
+            // 2. Apply RoPE to Q and K
+            if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, 0, false, freq_base, freq_scale, ext_factor, attn_factor, DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+            if (ok) ok = ds4_gpu_rope_tail_tensor(g->kv_raw, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, 0, false, freq_base, freq_scale, ext_factor, attn_factor, DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+
+            // 3. FP8 KV quantization of Key, and store Key and Value into g->layer_raw_cache[il]
+            if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(g->kv_raw, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+            if (ok) ok = ds4_gpu_kv_fp8_store_raw_tensor(g->kv_raw, g->layer_raw_cache[il], 2 * g->raw_cap, 2 * raw_row, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+            if (ok) ok = ds4_gpu_store_raw_kv_tensor(g->layer_raw_cache[il], g->kv, 2 * g->raw_cap, 2 * raw_row + 1, DS4_N_HEAD_DIM) != 0;
+
+            // 4. Compute causal standard attention
+            const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+            if (ok) {
+                ok = ds4_gpu_attention_decode_heads_tensor(g->heads,
+                                                             model->map, model->size,
+                                                             layer->attn_q_a->abs_offset,
+                                                             g->q, g->layer_raw_cache[il], n_raw,
+                                                             2 * g->raw_cap,
+                                                             raw_start,
+                                                             NULL,
+                                                             0,
+                                                             0,
+                                                             NULL,
+                                                             0,
+                                                             DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+            }
+
+            // 5. Apply Sigmoid Gate
+            if (ok) ok = ds4_gpu_qwen3_gated_attention(g->heads, g->comp_kv_cur, g->heads, q_dim) != 0;
+        }
+#else
+        (void)layer; (void)model; (void)pos; (void)raw_cache; (void)raw_cap; (void)raw_row; (void)n_raw; (void)token; (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor;
+        ok = false;
+#endif
+    } else {
+        bool qkv_pair_projected = false;
+        if (ok && qkv_rms_fused) {
         qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(g->qr,
                                                              g->kv_raw,
                                                              model->map,
@@ -15472,6 +15556,7 @@ static bool metal_graph_encode_decode_layer(
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_back", g->heads, q_dim, il, pos);
+    }
     }
     const bool fuse_attn_out_hc =
         !metal_graph_directional_steering_attn_enabled(g) &&
@@ -17481,7 +17566,92 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
+    const bool is_qwen3 = (strcmp(g_ds4_shape.name, "Qwen3 Coder") == 0);
+    if (ok && is_qwen3) {
+#ifdef __APPLE__
+        const bool is_deltanet = (il + 1) % 4 != 0;
+        const uint64_t kv_dim = is_deltanet ? q_dim : (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+
+        // 1. Projections
+        ok = ds4_gpu_matmul_f16_tensor(g->batch_q, model->map, model->size, layer->attn_q_a->abs_offset, DS4_N_EMBD, q_dim, g->batch_attn_norm, n_tokens) != 0;
+        if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_kv_raw, model->map, model->size, layer->attn_q_b->abs_offset, DS4_N_EMBD, kv_dim, g->batch_attn_norm, n_tokens) != 0;
+        if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_kv, model->map, model->size, layer->attn_kv->abs_offset, DS4_N_EMBD, kv_dim, g->batch_attn_norm, n_tokens) != 0;
+        if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_comp_kv, model->map, model->size, layer->attn_compressor_gate->abs_offset, DS4_N_EMBD, q_dim, g->batch_attn_norm, n_tokens) != 0;
+
+        if (is_deltanet) {
+            // DeltaNet linear attention prefill step
+            if (ok) ok = ds4_gpu_qwen3_deltanet(
+                g->batch_q, g->batch_kv_raw, g->batch_kv, g->batch_comp_kv, g->layer_attn_state_kv[il], g->batch_heads,
+                n_tokens, DS4_N_HEAD, DS4_N_HEAD_DIM
+            ) != 0;
+        } else {
+            // Gated Causal Attention prefill step
+            // 2. Apply RoPE to Query and Key
+            if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q, n_tokens, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos0, 0, false, freq_base, freq_scale, ext_factor, attn_factor, DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+            if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_kv_raw, n_tokens, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos0, 0, false, freq_base, freq_scale, ext_factor, attn_factor, DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
+
+            // 3. Interleaved KV cache storage
+            for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                ds4_gpu_tensor *key_t = metal_graph_tensor_row_view(g->batch_kv_raw, t, DS4_N_HEAD_DIM);
+                ds4_gpu_tensor *val_t = metal_graph_tensor_row_view(g->batch_kv, t, DS4_N_HEAD_DIM);
+                if (key_t && val_t) {
+                    ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(key_t, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                    const uint32_t phys_row = (pos0 + t) % g->raw_cap;
+                    if (ok) ok = ds4_gpu_kv_fp8_store_raw_tensor(key_t, g->layer_raw_cache[il], 2 * g->raw_cap, 2 * phys_row, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                    if (ok) ok = ds4_gpu_store_raw_kv_tensor(g->layer_raw_cache[il], val_t, 2 * g->raw_cap, 2 * phys_row + 1, DS4_N_HEAD_DIM) != 0;
+                } else {
+                    ok = false;
+                }
+                if (key_t) ds4_gpu_tensor_free(key_t);
+                if (val_t) ds4_gpu_tensor_free(val_t);
+            }
+
+            // 4. Causal Attention
+            if (ok) {
+                if (zero_prefix) {
+                    ok = ds4_gpu_attention_prefill_raw_heads_tensor(g->batch_heads,
+                                                                      model->map,
+                                                                      model->size,
+                                                                      layer->attn_sinks->abs_offset,
+                                                                      g->batch_q,
+                                                                      g->layer_raw_cache[il],
+                                                                      n_tokens,
+                                                                      2 * g->raw_cap,
+                                                                      DS4_N_HEAD,
+                                                                      DS4_N_HEAD_DIM) != 0;
+                } else {
+                    const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, n_tokens);
+                    const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos0 + n_tokens - 1u, n_raw);
+                    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                        ds4_gpu_tensor *q_t = metal_graph_tensor_row_view(g->batch_q, t, q_dim);
+                        ds4_gpu_tensor *heads_t = metal_graph_tensor_row_view(g->batch_heads, t, q_dim);
+                        if (q_t && heads_t) {
+                            ok = ds4_gpu_attention_decode_heads_tensor(heads_t,
+                                                                         model->map, model->size,
+                                                                         layer->attn_sinks->abs_offset,
+                                                                         q_t, g->layer_raw_cache[il], pos0 + t + 1u,
+                                                                         2 * g->raw_cap,
+                                                                         raw_start,
+                                                                         NULL, 0, 0, NULL, 0,
+                                                                         DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                        } else {
+                            ok = false;
+                        }
+                        if (q_t) ds4_gpu_tensor_free(q_t);
+                        if (heads_t) ds4_gpu_tensor_free(heads_t);
+                    }
+                }
+            }
+
+            // 5. Apply Sigmoid Gate
+            if (ok) ok = ds4_gpu_qwen3_gated_attention(g->batch_heads, g->batch_comp_kv, g->batch_heads, (uint64_t)n_tokens * q_dim) != 0;
+        }
+#else
+        (void)layer; (void)model; (void)pos0; (void)n_tokens; (void)freq_base; (void)freq_scale; (void)ext_factor; (void)attn_factor; (void)zero_prefix; (void)comp_counts; (void)index_counts;
+        ok = false;
+#endif
+    } else {
+        if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_q_a",
                                                       il,
                                                       pos0,
                                                       g->batch_qr,
@@ -18726,6 +18896,7 @@ static bool metal_graph_encode_layer_attention_batch(
         metal_graph_debug_dump_tensor("kqv_back", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
+    }
     DS4_METAL_PROFILE_ATTN_STAGE("inv_rope");
     const bool attn_out_debug =
         metal_graph_debug_wants("attn_low", il, pos0) ||
@@ -18980,6 +19151,15 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
 
 #ifdef DS4_ROCM_BUILD
+    const bool is_qwen3 = (strcmp(DS4_MODEL_SHAPE_NAME, "Qwen3 Coder") == 0);
+    const bool expert_type_ok =
+        (layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+         layer->ffn_down_exps->type == DS4_TENSOR_Q2_K) ||
+        (is_qwen3 &&
+         layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+         layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+         layer->ffn_down_exps->type == DS4_TENSOR_Q4_K);
     rocm_graph_batch_selected_async_load rocm_batch_selected_async = {0};
     bool rocm_batch_selected_async_started = false;
     const bool rocm_batch_selected_shared_overlap =
@@ -18987,11 +19167,9 @@ static bool metal_graph_encode_layer_ffn_batch(
         g->ssd_streaming &&
         !g->quality &&
         n_tokens > 1 &&
-        DS4_N_EXPERT_USED == 6 &&
+        (DS4_N_EXPERT_USED == 6 || (is_qwen3 && DS4_N_EXPERT_USED == 10)) &&
         !rocm_graph_stream_prefill_full_layer_enabled(g, layer, n_tokens) &&
-        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
-        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+        expert_type_ok;
     if (rocm_batch_selected_shared_overlap) {
         uint64_t selected_event = 0;
         if (ds4_gpu_signal_selected_readback_ready(&selected_event) == 0) {
@@ -25534,11 +25712,13 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
         if (!layer->ffn_gate_exps || !layer->ffn_up_exps || !layer->ffn_down_exps) {
             continue;
         }
+        const bool is_qwen3 = (strcmp(DS4_MODEL_SHAPE_NAME, "Qwen3 Coder") == 0);
+        const bool valid_moe = (DS4_N_EXPERT == 384 && DS4_N_EXPERT_USED == 6) ||
+                               (is_qwen3 && DS4_N_EXPERT == 512 && DS4_N_EXPERT_USED == 10);
         if (layer->ffn_gate_exps->type != DS4_TENSOR_Q4_K ||
             layer->ffn_up_exps->type != DS4_TENSOR_Q4_K ||
             layer->ffn_down_exps->type != DS4_TENSOR_Q4_K ||
-            DS4_N_EXPERT != 384 ||
-            DS4_N_EXPERT_USED != 6) {
+            !valid_moe) {
             continue;
         }
 
