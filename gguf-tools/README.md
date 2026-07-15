@@ -132,3 +132,28 @@ make -C gguf-tools quality-score
 gguf-tools/quality-testing/score_official MODEL.gguf gguf-tools/quality-testing/data/manifest.tsv /tmp/model.tsv 4096
 python3 gguf-tools/quality-testing/compare_scores.py /tmp/old.tsv /tmp/new.tsv
 ```
+
+## Qwen3 Coder Support
+
+We provide scripts to download Qwen3/Qwen2.5 model weights and convert them to the GGUF shape expected by the DwarfStar engine.
+
+### 1. Download Model Weights
+Use `download_qwen3.py` to download the safetensors weights and model configuration from Hugging Face:
+
+```sh
+python3 gguf-tools/download_qwen3.py --repo Qwen/Qwen2.5-Coder-7B-Instruct --out-dir qwen3_model
+```
+
+Options:
+- `--repo`: Hugging Face repository ID (default: `Qwen/Qwen2.5-Coder-7B-Instruct`).
+- `--out-dir`: Local directory to save the downloaded model files.
+- `--token`: Optional Hugging Face API token for restricted/private repositories.
+
+### 2. Convert to DwarfStar GGUF
+Run `convert_qwen3.py` on the downloaded directory to map the weights to the target GGUF layout:
+
+```sh
+python3 gguf-tools/convert_qwen3.py --model-dir qwen3_model --out qwen3.gguf
+```
+
+The script automatically maps the attention projections and MoE routed expert shapes into DwarfStar structures, writing files instantly using sparse files to prevent disk usage exhaustion during development/testing.
